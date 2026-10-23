@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 #include "esphome/components/bthome/remote_device.h"
+#include "esphome/core/application.h"
 #include "esphome/core/helpers.h"
 
 namespace esphome::bthome::testing {
@@ -346,6 +347,79 @@ TEST_F(BTHomeAlternatingPayloadTest, SamePayloadWithNewPacketIdIsProcessed) {
   EXPECT_TRUE(this->parse_(next_packet, sizeof(next_packet)));
 
   EXPECT_EQ(this->voltage_.processed_objects().size(), 2);
+}
+
+// Receives a frame at `now` ms, as the hub does during a loop that started at that time.
+static bool receive_at(RemoteDeviceBase &device, const uint8_t *payload, size_t size, uint32_t now) {
+  LoopBlockingGuard clock{nullptr, nullptr, now};
+  return device.parse_data(make_device(TEST_MAC), payload, size);
+}
+
+TEST_F(BTHomeDeviceTest, SamePacketIdAfterAPauseIsProcessed) {
+  // PACKET_ID 7, BATTERY_PCT 97%
+  const uint8_t payload[] = {0x40, 0x00, 0x07, 0x01, 0x61};
+  receive_at(device_, payload, sizeof(payload), 1000);
+  // A copy 100 ms later is a repeat.
+  receive_at(device_, payload, sizeof(payload), 1100);
+  // A restarted transmitter sends packet ID 7 again, 5 s after the last copy: that is new data.
+  receive_at(device_, payload, sizeof(payload), 6100);
+
+  EXPECT_EQ(handler1_.processed_objects().size(), 2);
+}
+
+TEST_F(BTHomeDeviceTest, RepeatedFrameWithoutPacketIdIsIgnored) {
+  // BATTERY_PCT 97%, no packet ID
+  const uint8_t payload[] = {0x40, 0x01, 0x61};
+  receive_at(device_, payload, sizeof(payload), 1000);
+  // A copy 500 ms later is a repeat.
+  receive_at(device_, payload, sizeof(payload), 1500);
+  // 1.5 s after the last copy the same frame counts as new.
+  receive_at(device_, payload, sizeof(payload), 3000);
+
+  EXPECT_EQ(handler1_.processed_objects().size(), 2);
+}
+
+// Reads every battery object but leaves it to the next handler.
+class SharingBatteryHandler : public BTHomeRemoteObject {
+ public:
+  bool process_object(const BTHomeObject &object) override {
+    if (object.type == BTHomeObjectType::BATTERY_PCT)
+      this->seen++;
+    return false;
+  }
+  void log_config() override {}
+  int seen{0};
+};
+
+TEST_F(BTHomeDeviceTest, HandlerReturningFalseLeavesTheObjectToTheNextOne) {
+  RemoteDevice<2> device;
+  SharingBatteryHandler sharing;
+  MockBTHomeRemoteObject battery{BTHomeObjectType::BATTERY_PCT};
+  device.set_address(TEST_MAC);
+  device.set_handler(0, &sharing);
+  device.set_handler(1, &battery);
+
+  // BATTERY_PCT 97%
+  const uint8_t payload[] = {0x40, 0x01, 0x61};
+  EXPECT_TRUE(device.parse_data(make_device(TEST_MAC), payload, sizeof(payload)));
+
+  EXPECT_EQ(sharing.seen, 1);
+  EXPECT_EQ(battery.processed_objects().size(), 1);
+}
+
+TEST_F(BTHomeDeviceTest, ValueThatComesBackWithoutPacketIdIsProcessed) {
+  // BATTERY_PCT without a packet ID, one frame every 500 ms: 97 %, 50 %, then 97 % again
+  const uint8_t full[] = {0x40, 0x01, 0x61};
+  const uint8_t half[] = {0x40, 0x01, 0x32};
+  receive_at(device_, full, sizeof(full), 1000);
+  receive_at(device_, half, sizeof(half), 1500);
+  receive_at(device_, full, sizeof(full), 2000);
+  // A copy of the last frame is still a repeat.
+  receive_at(device_, full, sizeof(full), 2500);
+
+  // 97 %, 50 %, 97 %: the battery is back at 97 %.
+  ASSERT_EQ(handler1_.processed_objects().size(), 3);
+  EXPECT_FLOAT_EQ(handler1_.processed_objects().back().value, 97.0f);
 }
 
 }  // namespace esphome::bthome::testing

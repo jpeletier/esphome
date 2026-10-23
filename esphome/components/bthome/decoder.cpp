@@ -124,7 +124,11 @@ void BTHomePayloadDecoder::Iterator::parse_next_() {
     ESP_LOGVV(TAG, "BTHome objects not in ascending order");
   }
 
-  this->current_obj_ = {obj_type, this->ptr_, value_length};
+  // BTHome sends object IDs in ascending order, so objects of one type are adjacent; an unsorted payload restarts
+  // the count at each type change.
+  const bool same_type = this->current_obj_.data != nullptr && obj_type == this->current_obj_.type;
+  const uint8_t index = same_type ? this->current_obj_.index + 1 : 0;
+  this->current_obj_ = {obj_type, this->ptr_, value_length, index};
   this->ptr_ += value_length;
   this->remaining_ -= value_length;
 }
